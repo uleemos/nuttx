@@ -306,11 +306,16 @@ int esp32p4_ppa_scale(const void *src, uint16_t src_w, uint16_t src_h,
       return -EINVAL;
     }
 
-  nxmutex_lock(&g_ppa_dev.lock);
   if (!g_ppa_dev.initialized)
     {
-      esp32p4_ppa_init();
+      int ret = esp32p4_ppa_init();
+      if (ret < 0)
+        {
+          return ret;
+        }
     }
+
+  nxmutex_lock(&g_ppa_dev.lock);
 
   size_t src_size = (size_t)src_w * src_h * esp32p4_ppa_get_bpp(color_fmt);
   size_t dst_size = (size_t)dst_w * dst_h * esp32p4_ppa_get_bpp(color_fmt);
@@ -451,11 +456,16 @@ int esp32p4_ppa_rotate(const void *src, uint16_t w, uint16_t h,
       return -EINVAL;
     }
 
-  nxmutex_lock(&g_ppa_dev.lock);
   if (!g_ppa_dev.initialized)
     {
-      esp32p4_ppa_init();
+      int ret = esp32p4_ppa_init();
+      if (ret < 0)
+        {
+          return ret;
+        }
     }
+
+  nxmutex_lock(&g_ppa_dev.lock);
 
   uint16_t dst_w = (rotation == ESP32P4_PPA_ROT_90 ||
                     rotation == ESP32P4_PPA_ROT_270) ? h : w;
@@ -557,11 +567,16 @@ int esp32p4_ppa_blend(const void *bg, const void *fg, void *dst,
       return -EINVAL;
     }
 
-  nxmutex_lock(&g_ppa_dev.lock);
   if (!g_ppa_dev.initialized)
     {
-      esp32p4_ppa_init();
+      int ret = esp32p4_ppa_init();
+      if (ret < 0)
+        {
+          return ret;
+        }
     }
+
+  nxmutex_lock(&g_ppa_dev.lock);
 
   size_t img_size = (size_t)w * h * esp32p4_ppa_get_bpp(color_fmt);
 
@@ -674,11 +689,16 @@ int esp32p4_ppa_fill(void *dst, uint16_t w, uint16_t h,
       return -EINVAL;
     }
 
-  nxmutex_lock(&g_ppa_dev.lock);
   if (!g_ppa_dev.initialized)
     {
-      esp32p4_ppa_init();
+      int ret = esp32p4_ppa_init();
+      if (ret < 0)
+        {
+          return ret;
+        }
     }
+
+  nxmutex_lock(&g_ppa_dev.lock);
 
   size_t dst_size = (size_t)w * h * esp32p4_ppa_get_bpp(color_fmt);
 
@@ -739,11 +759,16 @@ int esp32p4_ppa_csc(const void *src, void *dst, uint16_t w, uint16_t h,
       return -EINVAL;
     }
 
-  nxmutex_lock(&g_ppa_dev.lock);
   if (!g_ppa_dev.initialized)
     {
-      esp32p4_ppa_init();
+      int ret = esp32p4_ppa_init();
+      if (ret < 0)
+        {
+          return ret;
+        }
     }
+
+  nxmutex_lock(&g_ppa_dev.lock);
 
   size_t src_size = (size_t)w * h * esp32p4_ppa_get_bpp(src_fmt);
   size_t dst_size = (size_t)w * h * esp32p4_ppa_get_bpp(dst_fmt);

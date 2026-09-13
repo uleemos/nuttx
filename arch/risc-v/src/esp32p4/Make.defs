@@ -69,3 +69,11 @@ CFLAGS += -include common/espressif/esp_p4_sched_compat.h
 # local to that single dependency source instead of patching the checkout.
 
 chip$(DELIM)$(ESP_HAL_3RDPARTY_REPO)$(DELIM)nuttx$(DELIM)src$(DELIM)platform$(DELIM)os.c_CFLAGS += -include common/espressif/esp_p4_hal_os_compat.h
+
+# The NuttX P4 image uses the ROM SHA implementation.  Selecting the HAL's
+# RAM/non-OS branch also keeps bootloader_sha.c from pulling the ESP-IDF PSA
+# headers into builds that enable the independent nuttx-apps Mbed TLS library.
+# Both libraries otherwise export an mbedtls/ include tree with incompatible
+# configuration headers.
+
+chip$(DELIM)$(ESP_HAL_3RDPARTY_REPO)$(DELIM)components$(DELIM)bootloader_support$(DELIM)src$(DELIM)bootloader_sha.c_CFLAGS += -DNON_OS_BUILD=1

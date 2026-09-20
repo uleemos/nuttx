@@ -841,7 +841,8 @@ static void esp32p4_eventtimeout(wdparm_t arg)
       esp32p4_interrupt(0, NULL, priv);
       if (priv->wkupevent != 0)
         {
-          syslog(LOG_INFO, "SDMMC: watchdog serviced latched event slot=%d event=0x%x\n",
+          syslog(LOG_INFO, "SDMMC: watchdog serviced latched event "
+                 "slot=%d event=0x%x\n",
                  priv->slot, priv->wkupevent);
           return;
         }
@@ -1154,7 +1155,9 @@ static int esp32p4_interrupt(int irq, void *context, void *arg)
               (pending & (SDMMC_INT_DCRC | SDMMC_INT_DRTO)) != 0)
             {
               /* C6-specific CRC/DTO tolerance must not mask card errors. */
-              esp32p4_endtransfer(priv, SDIOWAIT_TRANSFERDONE | SDIOWAIT_ERROR);
+
+              esp32p4_endtransfer(priv, SDIOWAIT_TRANSFERDONE |
+                                  SDIOWAIT_ERROR);
             }
           else if ((pending & SDMMC_INT_DCRC) != 0 &&
               (pending & SDMMC_INT_DTO) == 0)
@@ -1383,7 +1386,8 @@ static int esp32p4_lock(struct sdio_dev_s *dev, bool lock)
       if (attempt == 100 || priv->remaining != 0)
         {
           g_host_fault = true;
-          syslog(LOG_ERR, "SDMMC shared: non-quiescent handoff; reboot required\n");
+          syslog(LOG_ERR, "SDMMC shared: non-quiescent handoff; "
+                 "reboot required\n");
         }
     }
 
@@ -1420,7 +1424,8 @@ static void esp32p4_reset(struct sdio_dev_s *dev)
 #ifdef CONFIG_ESP32P4_SDMMC_SHARED_POLLED
   if (g_host_initialized)
     {
-      syslog(LOG_ERR, "SDMMC shared: live host reset refused; reboot required\n");
+      syslog(LOG_ERR, "SDMMC shared: live host reset refused; "
+             "reboot required\n");
       return;
     }
 #endif
@@ -1685,6 +1690,7 @@ static void sdmmc_host_get_clk_dividers(uint32_t freq_khz, int *host_div,
 {
 #ifdef CONFIG_ESP32P4_SDMMC_SHARED_POLLED
   /* Keep the common source at 40MHz; only card-local dividers change. */
+
   *host_div = 4;
   *card_div = freq_khz >= 40000 ? 0 :
               (40000 + 2 * freq_khz - 1) / (2 * freq_khz);
@@ -1785,6 +1791,7 @@ static void sdmmc_host_set_clk_div(uint32_t slot, uint32_t host_div,
 
 #ifdef CONFIG_ESP32P4_SDMMC_SHARED_POLLED
   /* The common divider/phase was established before either card opened. */
+
   if (g_host_initialized)
     {
       leave_critical_section(flags);
@@ -2341,6 +2348,7 @@ static int esp32p4_cancel(struct sdio_dev_s *dev)
   /* CANCEL is not proof that DMA stopped.  Exclude every subsequent
    * transaction until reboot, even if the command/data busy bits clear.
    */
+
   if (priv->remaining) g_host_fault = true;
 #endif
 
@@ -2824,6 +2832,7 @@ static sdio_eventset_t esp32p4_eventwait(struct sdio_dev_s *dev)
   for (; ; )
     {
       /* Prefer real hardware state over an expired polling deadline. */
+
       leave_critical_section(flags);
       esp32p4_interrupt(0, NULL, priv);
       flags = enter_critical_section();
@@ -2843,7 +2852,6 @@ static sdio_eventset_t esp32p4_eventwait(struct sdio_dev_s *dev)
           wd_cancel(&priv->waitwdog);
           break;
         }
-
     }
 
   UNUSED(ret);
@@ -3444,6 +3452,7 @@ struct sdio_dev_s *esp32p4_sdmmc_sdio_initialize(int slotno)
       syslog(LOG_ERR, "SDMMC: other slot owns host; reboot to switch\n");
       return NULL;
     }
+
   owner = slotno;
   leave_critical_section(flags);
 #endif
@@ -3528,6 +3537,7 @@ struct sdio_dev_s *esp32p4_sdmmc_sdio_initialize(int slotno)
     }
 
   /* No second controller/DMA reset. Each slot selects its own divider. */
+
   regval = esp32p4_getreg(ESP32P4_SDMMC_CLKSRC);
   regval &= ~SDMMC_CLKSRC_MASK(slotno);
   regval |= SDMMC_CLKSRC_CLKDIV(slotno, slotno);
@@ -3606,6 +3616,7 @@ void esp32p4_sdmmc_set_sample_phase(unsigned int phase)
 
 #ifdef CONFIG_ESP32P4_SDMMC_SHARED_POLLED
   /* Global phase retuning is deliberately excluded from shared mode. */
+
   syslog(LOG_ERR, "SDMMC shared: sample-phase retuning refused\n");
   return;
 #endif

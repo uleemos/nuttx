@@ -1397,7 +1397,6 @@ static int es8311_processbegin(FAR struct es8311_dev_s *priv)
           auderr("I2S transfer failed: %d\n", ret);
           break;
         }
-
     }
 
   nxmutex_unlock(&priv->pendlock);

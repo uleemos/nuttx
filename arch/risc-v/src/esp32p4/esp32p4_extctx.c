@@ -1,10 +1,29 @@
-/* SPDX-License-Identifier: Apache-2.0 */
+/****************************************************************************
+ * arch/risc-v/src/esp32p4/esp32p4_extctx.c
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ ****************************************************************************/
+
+/****************************************************************************
+ * Included Files
+ ****************************************************************************/
+
 #include <nuttx/config.h>
-#include <nuttx/sched.h>
-#include <arch/irq.h>
+
 #include <string.h>
 
-/* Newly created tasks must not inherit another task's live hardware loops. */
+#include <nuttx/sched.h>
+
+#include <arch/irq.h>
+
+/****************************************************************************
+ * Public Functions
+ ****************************************************************************/
+
+/****************************************************************************
+ * Name: riscv_initial_extctx_state
+ ****************************************************************************/
+
 void riscv_initial_extctx_state(struct tcb_s *tcb)
 {
   memset(&tcb->xcp.regs[REG_INT_CTX_NDX + 1], 0,

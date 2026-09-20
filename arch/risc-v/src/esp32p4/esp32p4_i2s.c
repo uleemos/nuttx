@@ -703,6 +703,7 @@ static void i2s_rx_worker(FAR void *arg)
            * invalidate an unaligned APB and discard adjacent CPU metadata.
            * RX length is written by DMA, not inferred from capacity.
            */
+
           int sync = esp_cache_msync(&buf->dma_desc, I2S_DMA_CACHE_ALIGN,
                                     ESP_CACHE_MSYNC_FLAG_DIR_M2C);
           unsigned int length = buf->dma_desc.dw0.length;
@@ -712,14 +713,16 @@ static void i2s_rx_worker(FAR void *arg)
               length > apb->nmaxbytes || (length % 4) != 0 ||
               buf->dma_desc.dw0.err_eof)
             {
-              i2serr("RX invalid completion: sync=%d owner=%u length=%u capacity=%u\n",
+              i2serr("RX invalid completion: sync=%d owner=%u "
+                     "length=%u capacity=%u\n",
                      sync, buf->dma_desc.dw0.owner, length, apb->nmaxbytes);
               result = -EIO;
             }
           else
             {
               sync = esp_cache_msync(buf->dma_desc.buffer,
-                                    I2S_ALIGN_UP(length, I2S_DMA_CACHE_ALIGN),
+                                    I2S_ALIGN_UP(length,
+                                                 I2S_DMA_CACHE_ALIGN),
                                     ESP_CACHE_MSYNC_FLAG_DIR_M2C);
               if (sync != ESP_OK && sync != ESP_ERR_NOT_SUPPORTED)
                 result = -EIO;

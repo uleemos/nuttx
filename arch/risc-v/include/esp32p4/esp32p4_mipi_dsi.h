@@ -179,6 +179,16 @@ int esp32p4_mipi_dsi_start_video(void);
 int esp32p4_mipi_dsi_stop_video(void);
 
 /****************************************************************************
+ * Name: esp32p4_mipi_dsi_dump
+ *
+ * Description:
+ *   Print DSI Host, Bridge, and display DMA state for bring-up diagnostics.
+ *
+ ****************************************************************************/
+
+void esp32p4_mipi_dsi_dump(void);
+
+/****************************************************************************
  * Name: esp32p4_fb_initialize
  *
  * Description:

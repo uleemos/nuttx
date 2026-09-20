@@ -723,7 +723,11 @@ int esp32p4_mipi_csi_deinit(void)
           mipi_csi_ll_enable_phy_config_clock(0, false);
         }
 
-      ldo_ll_enable(ESP32P4_CSI_MIPI_PHY_LDO_UNIT, false);
+      /* LDO_VO3 supplies both MIPI CSI and MIPI DSI on ESP32-P4.  Keep the
+       * rail enabled when stopping CSI so a running display is not blanked.
+       * The rail is intentionally left on until reset because the current
+       * CSI and DSI drivers do not yet share a common reference counter.
+       */
 
       priv->initialized = false;
       priv->enabled     = false;

@@ -647,6 +647,9 @@ if ARCH_RISCV_INTXCPT_EXTENSIONS
 
 config ARCH_RISCV_INTXCPT_EXTREGS
 	int "Number of Extral RISC-V Integer Context Registers"
+	default 70 if ESP32P4_PIE_CONTEXT && ESP32P4_FPU_DIAGNOSTIC
+	default 67 if ESP32P4_PIE_CONTEXT
+	default 7 if ESP32P4_HWLP_CONTEXT
 	default 0
 
 endif

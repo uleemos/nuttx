@@ -65,6 +65,7 @@
 #include "soc/cache_reg.h"
 #include "esp_private/periph_ctrl.h"
 #include "esp_ldo_regulator.h"
+#include <nuttx/mutex.h>
 
 #ifdef CONFIG_ESP32P4_SDMMC_DMA
 #  define ESP32P4_NC_ADDR(p) \
@@ -248,6 +249,7 @@ struct esp32p4_dev_s
 
   int                slot;            /* SDMMC slot number */
   int                cpuint;          /* Allocated CPU interrupt */
+  uint32_t           timeout_reg;     /* Per-card timeout in shared mode */
 
   const sdmmc_slot_io_info_t *sdio_pins;
   const sdmmc_slot_info_t *slot_info;
@@ -391,6 +393,16 @@ struct esp32p4_dev_s g_sdiodev =
   },
   .waitsem = SEM_INITIALIZER(0),
 };
+
+#ifdef CONFIG_ESP32P4_SDMMC_SHARED_POLLED
+static struct esp32p4_dev_s g_slots[2];
+static bool g_slot_initialized[2];
+static bool g_host_initialized;
+static volatile bool g_host_fault;
+static rmutex_t g_host_lock = NXRMUTEX_INITIALIZER;
+static unsigned int g_host_depth;
+static struct esp32p4_dev_s *g_active_slot;
+#endif
 
 /* Common SDMMC slot info.  Index 0 is slot 0, index 1 is slot 1.  The
  * numeric constants come from soc/gpio_sig_map.h (hw_ver3): the "_1_"
@@ -817,11 +829,34 @@ static void esp32p4_eventtimeout(wdparm_t arg)
   DEBUGASSERT((priv->waitevents & SDIOWAIT_TIMEOUT) != 0 ||
               priv->wkupevent != 0);
 
+  /* In polled mode the owner can be preempted after hardware finishes.
+   * Service the actual latched completion/errors before declaring a software
+   * deadline failure.  The transaction lock still excludes the other slot.
+   */
+
+#ifdef CONFIG_ESP32P4_SDMMC_SHARED_POLLED
+  if (g_active_slot == priv && priv->remaining &&
+      esp32p4_getreg(ESP32P4_SDMMC_MINTSTS) != 0)
+    {
+      esp32p4_interrupt(0, NULL, priv);
+      if (priv->wkupevent != 0)
+        {
+          syslog(LOG_INFO, "SDMMC: watchdog serviced latched event slot=%d event=0x%x\n",
+                 priv->slot, priv->wkupevent);
+          return;
+        }
+    }
+#endif
+
   /* Is a data transfer complete event expected? */
 
   if ((priv->waitevents & SDIOWAIT_TIMEOUT) != 0)
     {
       /* Yes.. wake up any waiting threads */
+
+#ifdef CONFIG_ESP32P4_SDMMC_SHARED_POLLED
+      g_host_fault = true;
+#endif
 
       esp32p4_endwait(priv, SDIOWAIT_TIMEOUT);
       syslog(LOG_ERR,
@@ -969,6 +1004,9 @@ static void esp32p4_drain_fifo(struct esp32p4_dev_s *priv)
 static void esp32p4_endtransfer(struct esp32p4_dev_s *priv,
                                 sdio_eventset_t wkupevent)
 {
+#ifdef CONFIG_ESP32P4_SDMMC_SHARED_POLLED
+  if (wkupevent & (SDIOWAIT_ERROR | SDIOWAIT_TIMEOUT)) g_host_fault = true;
+#endif
   mcinfo("wkupevent=%04x\n", (unsigned)wkupevent);
 
   /* Disable all transfer related interrupts */
@@ -1112,7 +1150,13 @@ static int esp32p4_interrupt(int irq, void *context, void *arg)
            * instead of aborting first and flushing the FIFO.
            */
 
-          if ((pending & SDMMC_INT_DCRC) != 0 &&
+          if (priv->slot == 0 &&
+              (pending & (SDMMC_INT_DCRC | SDMMC_INT_DRTO)) != 0)
+            {
+              /* C6-specific CRC/DTO tolerance must not mask card errors. */
+              esp32p4_endtransfer(priv, SDIOWAIT_TRANSFERDONE | SDIOWAIT_ERROR);
+            }
+          else if ((pending & SDMMC_INT_DCRC) != 0 &&
               (pending & SDMMC_INT_DTO) == 0)
             {
 #ifdef CONFIG_ESP32P4_SDMMC_DMA
@@ -1296,9 +1340,60 @@ static int esp32p4_interrupt(int irq, void *context, void *arg)
 #ifdef CONFIG_SDIO_MUXBUS
 static int esp32p4_lock(struct sdio_dev_s *dev, bool lock)
 {
+#ifdef CONFIG_ESP32P4_SDMMC_SHARED_POLLED
+  struct esp32p4_dev_s *priv = (struct esp32p4_dev_s *)dev;
+  int ret;
+  int attempt;
+
+  if (lock)
+    {
+      ret = nxrmutex_lock(&g_host_lock);
+      if (ret < 0) return ret;
+      if (g_host_fault || (g_host_depth && g_active_slot != priv))
+        {
+          nxrmutex_unlock(&g_host_lock);
+          return -EIO;
+        }
+
+      if (g_host_depth++ == 0)
+        {
+          g_active_slot = priv;
+          esp32p4_putreg(priv->timeout_reg, ESP32P4_SDMMC_TMOUT);
+        }
+
+      return OK;
+    }
+
+  if (!nxrmutex_is_hold(&g_host_lock) || !g_host_depth ||
+      g_active_slot != priv) return -EPERM;
+  if (--g_host_depth == 0)
+    {
+      /* Do not transfer a live command/data engine to another slot.  No
+       * controller reset here: a failing client may still own DMA memory.
+       */
+
+      for (attempt = 0; attempt < 100; attempt++)
+        {
+          if (!(esp32p4_getreg(ESP32P4_SDMMC_CMD) & SDMMC_CMD_STARTCMD) &&
+              !(esp32p4_getreg(ESP32P4_SDMMC_STATUS) &
+                SDMMC_STATUS_DATAFSMBUSY)) break;
+          up_udelay(1000);
+        }
+
+      if (attempt == 100 || priv->remaining != 0)
+        {
+          g_host_fault = true;
+          syslog(LOG_ERR, "SDMMC shared: non-quiescent handoff; reboot required\n");
+        }
+    }
+
+  ret = nxrmutex_unlock(&g_host_lock);
+  return g_host_fault ? -EIO : ret;
+#else
   /* The multiplex bus is part of board support package. */
 
   return OK;
+#endif
 }
 #endif
 
@@ -1321,6 +1416,14 @@ static void esp32p4_reset(struct sdio_dev_s *dev)
   struct esp32p4_dev_s *priv = (struct esp32p4_dev_s *)dev;
   irqstate_t flags;
   uint32_t regval;
+
+#ifdef CONFIG_ESP32P4_SDMMC_SHARED_POLLED
+  if (g_host_initialized)
+    {
+      syslog(LOG_ERR, "SDMMC shared: live host reset refused; reboot required\n");
+      return;
+    }
+#endif
 
   mcinfo("Resetting...\n");
 
@@ -1478,6 +1581,10 @@ static void esp32p4_widebus(struct sdio_dev_s *dev, bool wide)
   struct esp32p4_dev_s *priv = (struct esp32p4_dev_s *)dev;
   uint32_t regval;
 
+#ifdef CONFIG_ESP32P4_SDMMC_SHARED_POLLED
+  if (esp32p4_lock(dev, true) < 0) return;
+#endif
+
   regval = esp32p4_getreg(ESP32P4_SDMMC_CTYPE);
   regval &= ~(SDMMC_CTYPE_WIDTH4_MASK(priv->slot));
   regval &= ~(SDMMC_CTYPE_WIDTH8_MASK(priv->slot));
@@ -1487,16 +1594,28 @@ static void esp32p4_widebus(struct sdio_dev_s *dev, bool wide)
     {
       regval |= SDMMC_CTYPE_WIDTH4_MASK(priv->slot);
 
-      configure_pin(CONFIG_ESP32P4_SDMMC_D1, priv->sdio_pins->d1,
-                    INPUT | OUTPUT | PULLUP);
-      configure_pin(CONFIG_ESP32P4_SDMMC_D2, priv->sdio_pins->d2,
-                    INPUT | OUTPUT | PULLUP);
-      configure_pin(CONFIG_ESP32P4_SDMMC_D3, priv->sdio_pins->d3,
-                    INPUT | OUTPUT | PULLUP);
+      if (priv->slot == 0)
+        {
+          esp_configgpio(40, INPUT | OUTPUT | PULLUP | DRIVE_3 | FUNCTION_1);
+          esp_configgpio(41, INPUT | OUTPUT | PULLUP | DRIVE_3 | FUNCTION_1);
+          esp_configgpio(42, INPUT | OUTPUT | PULLUP | DRIVE_3 | FUNCTION_1);
+        }
+      else
+        {
+          configure_pin(CONFIG_ESP32P4_SDMMC_D1, priv->sdio_pins->d1,
+                        INPUT | OUTPUT | PULLUP);
+          configure_pin(CONFIG_ESP32P4_SDMMC_D2, priv->sdio_pins->d2,
+                        INPUT | OUTPUT | PULLUP);
+          configure_pin(CONFIG_ESP32P4_SDMMC_D3, priv->sdio_pins->d3,
+                        INPUT | OUTPUT | PULLUP);
+        }
     }
 #endif
 
   esp32p4_putreg(regval, ESP32P4_SDMMC_CTYPE);
+#ifdef CONFIG_ESP32P4_SDMMC_SHARED_POLLED
+  esp32p4_lock(dev, false);
+#endif
 }
 
 /****************************************************************************
@@ -1564,6 +1683,12 @@ static int sdmmc_host_clock_update_command(struct esp32p4_dev_s *priv)
 static void sdmmc_host_get_clk_dividers(uint32_t freq_khz, int *host_div,
                                         int *card_div)
 {
+#ifdef CONFIG_ESP32P4_SDMMC_SHARED_POLLED
+  /* Keep the common source at 40MHz; only card-local dividers change. */
+  *host_div = 4;
+  *card_div = freq_khz >= 40000 ? 0 :
+              (40000 + 2 * freq_khz - 1) / (2 * freq_khz);
+#else
   uint32_t clk_src_freq_hz = ESP32P4_SDMMC_SRC_FREQ_HZ;
 
   /* Calculate new dividers */
@@ -1605,6 +1730,7 @@ static void sdmmc_host_get_clk_dividers(uint32_t freq_khz, int *host_div,
           (*host_div)++;
         }
     }
+#endif
 }
 
 /****************************************************************************
@@ -1656,6 +1782,15 @@ static void sdmmc_host_set_clk_div(uint32_t slot, uint32_t host_div,
   regval &= ~SDMMC_CLKDIV_MASK(divider);
   regval |= SDMMC_CLKDIV(divider, card_div);
   esp32p4_putreg(regval, ESP32P4_SDMMC_CLKDIV);
+
+#ifdef CONFIG_ESP32P4_SDMMC_SHARED_POLLED
+  /* The common divider/phase was established before either card opened. */
+  if (g_host_initialized)
+    {
+      leave_critical_section(flags);
+      return;
+    }
+#endif
 
   /* Set the host divider and the drive/sample/self phase clocks in
    * HP_SYS_CLKRST.PERI_CLK_CTRL02.  ESP-IDF's sdmmc_ll_init_phase_delay()
@@ -1727,6 +1862,10 @@ static void esp32p4_clock(struct sdio_dev_s *dev, enum sdio_clock_e rate)
   int card_div = 0;   /* 1/2 of card clock divider (SDMMC.clkdiv) */
   struct esp32p4_dev_s *priv = (struct esp32p4_dev_s *)dev;
 
+#ifdef CONFIG_ESP32P4_SDMMC_SHARED_POLLED
+  if (esp32p4_lock(dev, true) < 0) return;
+#endif
+
   switch (rate)
     {
       /* Disable clocking (with default ID mode divisor) */
@@ -1782,7 +1921,7 @@ static void esp32p4_clock(struct sdio_dev_s *dev, enum sdio_clock_e rate)
   if (sdmmc_host_clock_update_command(priv) != OK)
     {
       mcerr("disabling clk failed\n");
-      return;
+      goto done;
     }
 
   /* Program card clock settings, send them to the CIU */
@@ -1792,7 +1931,7 @@ static void esp32p4_clock(struct sdio_dev_s *dev, enum sdio_clock_e rate)
   if (sdmmc_host_clock_update_command(priv) != OK)
     {
       mcerr("setting clk div failed\n");
-      return;
+      goto done;
     }
 
   /* Re-enable clocks */
@@ -1811,7 +1950,7 @@ static void esp32p4_clock(struct sdio_dev_s *dev, enum sdio_clock_e rate)
       if (sdmmc_host_clock_update_command(priv) != OK)
         {
           mcerr("re-enabling clk failed\n");
-          return;
+          goto done;
         }
     }
 
@@ -1830,6 +1969,12 @@ static void esp32p4_clock(struct sdio_dev_s *dev, enum sdio_clock_e rate)
 
   regval |= SDMMC_TMOUT_RESPONSE_MASK;
   esp32p4_putreg(regval, ESP32P4_SDMMC_TMOUT);
+  priv->timeout_reg = regval;
+done:
+#ifdef CONFIG_ESP32P4_SDMMC_SHARED_POLLED
+  esp32p4_lock(dev, false);
+#endif
+  return;
 }
 
 /****************************************************************************
@@ -1848,6 +1993,9 @@ static void esp32p4_clock(struct sdio_dev_s *dev, enum sdio_clock_e rate)
 
 static int esp32p4_attach(struct sdio_dev_s *dev)
 {
+#ifdef CONFIG_ESP32P4_SDMMC_SHARED_POLLED
+  return -ENOTSUP;
+#endif
   uint32_t regval;
   struct esp32p4_dev_s *priv = (struct esp32p4_dev_s *)dev;
 
@@ -2188,6 +2336,13 @@ static int esp32p4_sendsetup(struct sdio_dev_s *dev, const uint8_t *buffer,
 static int esp32p4_cancel(struct sdio_dev_s *dev)
 {
   struct esp32p4_dev_s *priv = (struct esp32p4_dev_s *)dev;
+
+#ifdef CONFIG_ESP32P4_SDMMC_SHARED_POLLED
+  /* CANCEL is not proof that DMA stopped.  Exclude every subsequent
+   * transaction until reboot, even if the command/data busy bits clear.
+   */
+  if (priv->remaining) g_host_fault = true;
+#endif
 
   mcinfo("Cancelling..\n");
 
@@ -2668,6 +2823,10 @@ static sdio_eventset_t esp32p4_eventwait(struct sdio_dev_s *dev)
 
   for (; ; )
     {
+      /* Prefer real hardware state over an expired polling deadline. */
+      leave_critical_section(flags);
+      esp32p4_interrupt(0, NULL, priv);
+      flags = enter_critical_section();
       wkupevent = priv->wkupevent;
       if (wkupevent != 0)
         {
@@ -2676,15 +2835,15 @@ static sdio_eventset_t esp32p4_eventwait(struct sdio_dev_s *dev)
 
       if ((clock_systime_ticks() - start) > MSEC2TICK(1500))
         {
+#ifdef CONFIG_ESP32P4_SDMMC_SHARED_POLLED
+          g_host_fault = true;
+#endif
           wkupevent = SDIOWAIT_TIMEOUT;
           priv->wkupevent = wkupevent;
           wd_cancel(&priv->waitwdog);
           break;
         }
 
-      leave_critical_section(flags);
-      esp32p4_interrupt(0, NULL, priv);
-      flags = enter_critical_section();
     }
 
   UNUSED(ret);
@@ -3245,10 +3404,49 @@ static void esp32p4_sdmmc_enable_clock_reset(void)
 
 struct sdio_dev_s *esp32p4_sdmmc_sdio_initialize(int slotno)
 {
+#ifndef CONFIG_ESP32P4_SDMMC_SHARED_POLLED
+  static int owner = -1;
   struct esp32p4_dev_s *priv = &g_sdiodev;
+#else
+  struct esp32p4_dev_s *priv;
+#endif
   uint32_t regval;
+#ifndef CONFIG_ESP32P4_SDMMC_SHARED_POLLED
+  irqstate_t flags;
+#endif
 
-  DEBUGASSERT(slotno == 0 || slotno == 1);
+  if (slotno != 0 && slotno != 1)
+    {
+      return NULL;
+    }
+
+  /* One controller and one software instance: do not reset an active
+   * other slot.  Switching between isolated diagnostics requires reboot.
+   */
+
+#ifdef CONFIG_ESP32P4_SDMMC_SHARED_POLLED
+  if (nxrmutex_lock(&g_host_lock) < 0) return NULL;
+  priv = &g_slots[slotno];
+  if (g_slot_initialized[slotno] || g_host_fault)
+    {
+      nxrmutex_unlock(&g_host_lock);
+      return g_host_fault ? NULL : &priv->dev;
+    }
+
+  priv->dev = g_sdiodev.dev;
+  nxsem_init(&priv->waitsem, 0, 0);
+  priv->timeout_reg = SDMMC_TMOUT_RESPONSE_MASK | (40000u << 8);
+#else
+  flags = enter_critical_section();
+  if (owner >= 0 && owner != slotno)
+    {
+      leave_critical_section(flags);
+      syslog(LOG_ERR, "SDMMC: other slot owns host; reboot to switch\n");
+      return NULL;
+    }
+  owner = slotno;
+  leave_critical_section(flags);
+#endif
 
   priv->slot      = slotno;
   priv->cpuint    = -1;
@@ -3287,6 +3485,10 @@ struct sdio_dev_s *esp32p4_sdmmc_sdio_initialize(int slotno)
    * and phase.
    */
 
+#ifdef CONFIG_ESP32P4_SDMMC_SHARED_POLLED
+  if (!g_host_initialized)
+    {
+#endif
   esp32p4_sdmmc_enable_clock_reset();
 
   /* Reset the controller */
@@ -3320,32 +3522,59 @@ struct sdio_dev_s *esp32p4_sdmmc_sdio_initialize(int slotno)
   regval |= SDMMC_CTRL_INTENABLE;
   esp32p4_putreg(regval, ESP32P4_SDMMC_CTRL);
 
+#ifdef CONFIG_ESP32P4_SDMMC_SHARED_POLLED
+      sdmmc_host_set_clk_div(slotno, 4, 50);
+      g_host_initialized = true;
+    }
+
+  /* No second controller/DMA reset. Each slot selects its own divider. */
+  regval = esp32p4_getreg(ESP32P4_SDMMC_CLKSRC);
+  regval &= ~SDMMC_CLKSRC_MASK(slotno);
+  regval |= SDMMC_CLKSRC_CLKDIV(slotno, slotno);
+  esp32p4_putreg(regval, ESP32P4_SDMMC_CLKSRC);
+#endif
+
   /* Pin configuration (slot 1 is routed through the GPIO matrix).  CLK is
    * output-only; CMD and D0 are bidirectional with a pull-up.  The extra
    * data lines D1..D3 are configured by esp32p4_widebus() when 4-bit mode
    * is selected.
    */
 
-  configure_pin(CONFIG_ESP32P4_SDMMC_CLK, priv->sdio_pins->clk, OUTPUT);
-  configure_pin(CONFIG_ESP32P4_SDMMC_CMD, priv->sdio_pins->cmd,
-                INPUT | OUTPUT | PULLUP);
-  configure_pin(CONFIG_ESP32P4_SDMMC_D0, priv->sdio_pins->d0,
-                INPUT | OUTPUT | PULLUP);
-  configure_pin(CONFIG_ESP32P4_SDMMC_D1, priv->sdio_pins->d1,
-                INPUT | OUTPUT | PULLUP);
-  configure_pin(CONFIG_ESP32P4_SDMMC_D2, priv->sdio_pins->d2,
-                INPUT | OUTPUT | PULLUP);
+  if (slotno == 0)
+    {
+      /* P4 SD1 native IO MUX function 0 (NuttX FUNCTION_1).  Slot 0
+       * cannot use the slot 1 GPIO matrix signals.  V1.8 schematic
+       * sheets 2/5: CLK43 CMD44 D0..D3=39..42, LDO4 IO supply.
+       */
 
-  /* Keep DAT3 high during the initial 1-bit enumeration.  A low DAT3 while
-   * CMD0 is sent selects SPI mode on SD/SDIO devices.  ESP-IDF deliberately
-   * leaves DAT3 as a GPIO output-high and only attaches the SDMMC matrix
-   * signal after CCCR switches the card to 4-bit mode.
-   */
+      esp_configgpio(43, OUTPUT | DRIVE_3 | FUNCTION_1);
+      esp_configgpio(44, INPUT | OUTPUT | PULLUP | DRIVE_3 | FUNCTION_1);
+      esp_configgpio(39, INPUT | OUTPUT | PULLUP | DRIVE_3 | FUNCTION_1);
+      esp_configgpio(40, INPUT | PULLUP);
+      esp_configgpio(41, INPUT | PULLUP);
+      esp_gpiowrite(42, true);
+      esp_gpio_matrix_out(42, SIG_GPIO_OUT_IDX, false, false);
+      esp_configgpio(42, OUTPUT | PULLUP | DRIVE_3);
+    }
+  else
+    {
+      configure_pin(CONFIG_ESP32P4_SDMMC_CLK, priv->sdio_pins->clk, OUTPUT);
+      configure_pin(CONFIG_ESP32P4_SDMMC_CMD, priv->sdio_pins->cmd,
+                    INPUT | OUTPUT | PULLUP);
+      configure_pin(CONFIG_ESP32P4_SDMMC_D0, priv->sdio_pins->d0,
+                    INPUT | OUTPUT | PULLUP);
+      configure_pin(CONFIG_ESP32P4_SDMMC_D1, priv->sdio_pins->d1,
+                    INPUT | OUTPUT | PULLUP);
+      configure_pin(CONFIG_ESP32P4_SDMMC_D2, priv->sdio_pins->d2,
+                    INPUT | OUTPUT | PULLUP);
 
-  esp_gpiowrite(CONFIG_ESP32P4_SDMMC_D3, true);
-  esp_gpio_matrix_out(CONFIG_ESP32P4_SDMMC_D3, SIG_GPIO_OUT_IDX,
-                      false, false);
-  esp_configgpio(CONFIG_ESP32P4_SDMMC_D3, OUTPUT | PULLUP | DRIVE_3);
+      /* DAT3 high at CMD0 prevents accidental SPI mode selection. */
+
+      esp_gpiowrite(CONFIG_ESP32P4_SDMMC_D3, true);
+      esp_gpio_matrix_out(CONFIG_ESP32P4_SDMMC_D3, SIG_GPIO_OUT_IDX,
+                          false, false);
+      esp_configgpio(CONFIG_ESP32P4_SDMMC_D3, OUTPUT | PULLUP | DRIVE_3);
+    }
 
   /* Tie the card-interrupt input high (inactive), card-detect low (card
    * present -- the C6 is hard-wired) and write-protect inactive, all
@@ -3359,6 +3588,10 @@ struct sdio_dev_s *esp32p4_sdmmc_sdio_initialize(int slotno)
   esp_gpio_matrix_in(GPIO_MATRIX_CONST_ONE_INPUT,
                      priv->slot_info->write_protect, true);
 
+#ifdef CONFIG_ESP32P4_SDMMC_SHARED_POLLED
+  g_slot_initialized[slotno] = true;
+  nxrmutex_unlock(&g_host_lock);
+#endif
   return &priv->dev;
 }
 
@@ -3370,6 +3603,12 @@ void esp32p4_sdmmc_set_sample_phase(unsigned int phase)
 {
   irqstate_t flags;
   uint32_t regval;
+
+#ifdef CONFIG_ESP32P4_SDMMC_SHARED_POLLED
+  /* Global phase retuning is deliberately excluded from shared mode. */
+  syslog(LOG_ERR, "SDMMC shared: sample-phase retuning refused\n");
+  return;
+#endif
 
   phase &= 3u;
 

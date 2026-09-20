@@ -237,6 +237,7 @@
 #define SDMMC_STATUS_FIFOEMPTY         (1 << 2)  /* FIFO is empty */
 #define SDMMC_STATUS_FIFOFULL          (1 << 3)  /* FIFO is full */
 #define SDMMC_STATUS_DATABUSY          (1 << 9)  /* Card data busy */
+#define SDMMC_STATUS_DATAFSMBUSY       (1 << 10) /* Data state machine busy */
 #define SDMMC_STATUS_FIFOCOUNT_SHIFT   17
 #define SDMMC_STATUS_FIFOCOUNT_MASK    (0x1fffu << 17)
 #define SDMMC_STATUS_FIFOCOUNT(s) \

@@ -1043,13 +1043,22 @@ static int es8311_configure(FAR struct audio_lowerhalf_s *dev,
         priv->samprate  = caps->ac_controls.hw[0];
         priv->bpsamp    = caps->ac_controls.b[2];
 
-        ret = es8311_setsamplerate(priv) == -ENOTTY ? OK : ret;
+        ret = es8311_setsamplerate(priv);
+        if (ret == -ENOTTY)
+          {
+            ret = OK;
+          }
+
         if (ret < 0)
           {
             break;
           }
 
-        ret = es8311_setbitspersample(priv) == -ENOTTY ? OK : ret;
+        ret = es8311_setbitspersample(priv);
+        if (ret == -ENOTTY)
+          {
+            ret = OK;
+          }
       }
       break;
 
@@ -1090,13 +1099,22 @@ static int es8311_configure(FAR struct audio_lowerhalf_s *dev,
         priv->samprate  = caps->ac_controls.hw[0];
         priv->bpsamp    = caps->ac_controls.b[2];
 
-        ret = es8311_setsamplerate(priv) == -ENOTTY ? OK : ret;
+        ret = es8311_setsamplerate(priv);
+        if (ret == -ENOTTY)
+          {
+            ret = OK;
+          }
+
         if (ret != OK)
           {
             break;
           }
 
-        ret = es8311_setbitspersample(priv) == -ENOTTY ? OK : ret;
+        ret = es8311_setbitspersample(priv);
+        if (ret == -ENOTTY)
+          {
+            ret = OK;
+          }
       }
       break;
 
@@ -1379,6 +1397,7 @@ static int es8311_processbegin(FAR struct es8311_dev_s *priv)
           auderr("I2S transfer failed: %d\n", ret);
           break;
         }
+
     }
 
   nxmutex_unlock(&priv->pendlock);

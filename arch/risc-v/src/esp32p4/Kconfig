@@ -7,6 +7,47 @@ if ARCH_CHIP_ESP32P4
 
 source "arch/risc-v/src/common/espressif/Kconfig"
 
+config ESP32P4_FPU_DIAGNOSTIC
+  bool "Experimental P4 hardware float with soft calling convention"
+  default n
+  depends on ESP32P4_PIE_CONTEXT && !SMP
+  select ARCH_HAVE_FPU
+  select ARCH_FPU
+  ---help---
+    Enable RV32F and eager floating-point context preservation. Retain the
+    ilp32 calling convention used by existing HAL and ESP-NN libraries.
+    The extra integer frame padding preserves 16-byte PIE stack alignment.
+    Requires board validation before production use.
+
+config ESP32P4_HWLP_CONTEXT
+  bool "Preserve P4 hardware loops across context switches"
+  default n
+  depends on ARCH_RV32 && BUILD_FLAT && !SMP
+  select ARCH_RISCV_INTXCPT_EXTENSIONS
+  ---help---
+    Save the two hardware loop start/end/count sets and extension status
+    in the integer exception frame. Does not enable or preserve PIE.
+    Opt-in bring-up support, currently restricted to the flat single-core
+    configuration. All tasks begin with hardware loops disabled.
+
+config ESP32P4_PIE_PROBE
+  bool "P4 isolated PIE instruction diagnostic"
+  default n
+  depends on ESP32P4_HWLP_CONTEXT
+  ---help---
+    Compile a tiny vector dot-product diagnostic with VELAFIT_PIE_CC.
+    Does not enable general PIE context switching or optimized inference.
+
+config ESP32P4_PIE_CONTEXT
+  bool "Experimental task PIE context for ESP-NN"
+  default n
+  depends on ESP32P4_PIE_PROBE && !ARCH_RV_HAVE_CLIC && !ARCH_RV_SHADOW_STACK
+  ---help---
+    Eagerly preserve vector/accumulator/unaligned/SAR/writable CFG state.
+    Requires VELAFIT_PIE_CC. Restricted to ESP-NN-style CFG with saturation
+    status tracking disabled. Read-clear flags and PERF are not virtualized.
+    PIE must not be used in interrupt handlers. Validate before inference.
+
 config ESP32P4_SELECTS_REV_LESS_V3
   bool "Select ESP32-P4 revisions <3.0 (No >=3.x Support)"
   default n
@@ -277,6 +318,16 @@ config ESP32P4_SDMMC
 		SDIO link to the on-board ESP32-C6.
 
 if ESP32P4_SDMMC
+
+config ESP32P4_SDMMC_SHARED_POLLED
+	bool "Experimental serialized two-slot polled host"
+	default n
+	depends on ESP32P4_SDMMC_DMA
+	select SDIO_MUXBUS
+	---help---
+		Separate slot state with one transaction lock and fixed host clock.
+		All clients must hold SDIO_LOCK across a whole command/data transfer.
+		IRQ attachment is not supported. Failed handoff requires reboot.
 
 config ESP32P4_SDMMC_DMA
 	bool "Support SDMMC internal DMA"

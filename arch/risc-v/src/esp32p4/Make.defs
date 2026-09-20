@@ -37,6 +37,25 @@ include common/espressif/Make.defs
 
 CHIP_CSRCS += esp_chip_rev.c
 
+ifeq ($(CONFIG_ESP32P4_HWLP_CONTEXT),y)
+CHIP_CSRCS += esp32p4_extctx.c
+endif
+
+ifeq ($(CONFIG_ESP32P4_PIE_PROBE),y)
+ifeq ($(wildcard $(VELAFIT_PIE_CC)),)
+$(error CONFIG_ESP32P4_PIE_PROBE requires the pinned VELAFIT_PIE_CC compiler)
+endif
+CHIP_ASRCS += esp32p4_pie_probe.S
+esp32p4_pie_probe.o: CC = $(VELAFIT_PIE_CC)
+esp32p4_pie_probe.o: AFLAGS += -march=rv32imac_zicsr_xespv -mabi=ilp32
+endif
+
+ifeq ($(CONFIG_ESP32P4_PIE_CONTEXT),y)
+CHIP_ASRCS += esp32p4_pie_context.S
+esp32p4_pie_context.o: CC = $(VELAFIT_PIE_CC)
+esp32p4_pie_context.o: AFLAGS += -march=rv32imac_zicsr_xespv -mabi=ilp32
+endif
+
 ifeq ($(CONFIG_ESP32P4_MIPI_CSI),y)
 CHIP_CSRCS += esp32p4_mipi_csi.c
 endif

@@ -48,6 +48,7 @@
 #include <nuttx/audio/i2s.h>
 
 #include "riscv_internal.h"
+#include "esp_cache.h"
 #include "esp_gpio_p4.h"
 #include "esp_irq_p4.h"
 #include "esp32p4_i2s.h"
@@ -76,6 +77,8 @@
 #define I2S_SRC_CLK_FREQ 160000000UL /* PLL_160M clock source */
 
 #define I2S_ALIGN_UP(num, align) (((num) + ((align) - 1)) & ~((align) - 1))
+#define I2S_DMA_MAX_BYTES 4092
+#define I2S_DMA_CACHE_ALIGN 64
 
 /****************************************************************************
  * Private Types
@@ -86,7 +89,8 @@
 struct esp32p4_i2s_buf_s
 {
   struct esp32p4_i2s_buf_s *flink;
-  dma_descriptor_t dma_desc;
+  dma_descriptor_t dma_desc __attribute__((aligned(I2S_DMA_CACHE_ALIGN)));
+  uint8_t desc_padding[I2S_DMA_CACHE_ALIGN - sizeof(dma_descriptor_t)];
   i2s_callback_t callback;
   FAR void *arg;
   FAR struct ap_buffer_s *apb;
@@ -122,6 +126,8 @@ struct esp32p4_i2s_priv_s
   struct esp32p4_i2s_stream_s rx;
   struct esp32p4_i2s_buf_s tx_bufs[CONFIG_ESP32P4_I2S_MAXINFLIGHT];
   struct esp32p4_i2s_buf_s rx_bufs[CONFIG_ESP32P4_I2S_MAXINFLIGHT];
+  uint8_t rx_data[CONFIG_ESP32P4_I2S_MAXINFLIGHT][4096]
+    __attribute__((aligned(I2S_DMA_CACHE_ALIGN)));
   sq_queue_t tx_free;
   sq_queue_t rx_free;
 };
@@ -243,6 +249,7 @@ static void i2s_set_clock(FAR struct esp32p4_i2s_priv_s *priv)
   _i2s_ll_tx_clk_set_src(hw, I2S_CLK_SRC_PLL_160M);
   _i2s_ll_tx_set_mclk(hw, &mclk_div);
   i2s_ll_tx_set_bck_div_num(hw, bclk_div);
+  i2s_ll_tx_update(hw);
 #endif
 
 #ifdef CONFIG_ESP32P4_I2S0_RX
@@ -250,6 +257,7 @@ static void i2s_set_clock(FAR struct esp32p4_i2s_priv_s *priv)
   _i2s_ll_rx_clk_set_src(hw, I2S_CLK_SRC_PLL_160M);
   _i2s_ll_rx_set_mclk(hw, &mclk_div);
   i2s_ll_rx_set_bck_div_num(hw, bclk_div);
+  i2s_ll_rx_update(hw);
 #endif
 
   i2sinfo("I2S%d clk: rate=%" PRIu32 ", mclk=%" PRIu32
@@ -286,11 +294,18 @@ static void i2s_hw_init(FAR struct esp32p4_i2s_priv_s *priv)
 #ifdef CONFIG_ESP32P4_I2S0_TX
   HP_SYS_CLKRST.peri_clk_ctrl13.reg_i2s0_tx_clk_en = 1;
   _i2s_ll_mclk_bind_to_tx_clk(hw);
+#elif defined(CONFIG_ESP32P4_I2S0_RX)
+  /* MCLK has a single clock source selector.  When TX and RX are both
+   * enabled, keep it bound to TX: RX is configured to share that clock.
+   * Binding it to RX here would overwrite the TX selection and stall a
+   * playback-only transfer.
+   */
+
+  _i2s_ll_mclk_bind_to_rx_clk(hw);
 #endif
 
 #ifdef CONFIG_ESP32P4_I2S0_RX
   HP_SYS_CLKRST.peri_clk_ctrl11.reg_i2s0_rx_clk_en = 1;
-  _i2s_ll_mclk_bind_to_rx_clk(hw);
 #endif
 
   /* 3. Configure GPIOs via Matrix MUX */
@@ -330,6 +345,7 @@ static void i2s_hw_init(FAR struct esp32p4_i2s_priv_s *priv)
 #ifdef CONFIG_ESP32P4_I2S0_TX
   i2s_ll_tx_reset(hw);
   i2s_ll_tx_reset_fifo(hw);
+  i2s_ll_tx_enable_std(hw);
   i2s_ll_tx_set_slave_mod(hw, false);
   i2s_ll_tx_enable_msb_shift(hw, true);
   i2s_ll_tx_set_ws_width(hw, 32);
@@ -351,6 +367,7 @@ static void i2s_hw_init(FAR struct esp32p4_i2s_priv_s *priv)
 #ifdef CONFIG_ESP32P4_I2S0_RX
   i2s_ll_rx_reset(hw);
   i2s_ll_rx_reset_fifo(hw);
+  i2s_ll_rx_enable_std(hw);
   i2s_ll_rx_set_slave_mod(hw, true); /* RX slave shares TX clock */
   i2s_ll_rx_enable_msb_shift(hw, true);
   i2s_ll_rx_set_ws_width(hw, 32);
@@ -398,7 +415,7 @@ static void i2s_hw_init(FAR struct esp32p4_i2s_priv_s *priv)
                                   ESP_IRQ_TRIGGER_LEVEL,
                                   i2s_tx_interrupt, priv);
   DEBUGASSERT(priv->tx.cpuint >= 0);
-  up_enable_irq(priv->tx.cpuint);
+  up_enable_irq(ESP_SOURCE2IRQ(ETS_AHB_PDMA_OUT_CH0_INTR_SOURCE));
   ahb_dma_ll_tx_enable_interrupt(&AHB_DMA, priv->dma_channel,
                                  AHB_DMA_OUT_TOTAL_EOF_CH0_INT_ENA, true);
 #endif
@@ -408,9 +425,9 @@ static void i2s_hw_init(FAR struct esp32p4_i2s_priv_s *priv)
                                   ESP_IRQ_TRIGGER_LEVEL,
                                   i2s_rx_interrupt, priv);
   DEBUGASSERT(priv->rx.cpuint >= 0);
-  up_enable_irq(priv->rx.cpuint);
+  up_enable_irq(ESP_SOURCE2IRQ(ETS_AHB_PDMA_IN_CH0_INTR_SOURCE));
   ahb_dma_ll_rx_enable_interrupt(&AHB_DMA, priv->dma_channel,
-                                 AHB_DMA_IN_SUC_EOF_CH0_INT_ENA, true);
+                                 AHB_DMA_IN_DONE_CH0_INT_ENA, true);
 #endif
 }
 
@@ -424,6 +441,10 @@ static void i2s_tx_worker(FAR void *arg)
 {
   FAR struct esp32p4_i2s_priv_s *priv = (FAR struct esp32p4_i2s_priv_s *)arg;
   FAR struct esp32p4_i2s_buf_s *buf;
+  FAR struct ap_buffer_s *apb;
+  i2s_callback_t callback;
+  FAR void *cbarg;
+  int result;
   irqstate_t flags;
 
   for (; ; )
@@ -437,14 +458,19 @@ static void i2s_tx_worker(FAR void *arg)
           break;
         }
 
-      if (buf->callback != NULL)
-        {
-          buf->callback(&priv->dev, buf->apb, buf->arg, buf->result);
-        }
+      callback = buf->callback;
+      apb      = buf->apb;
+      cbarg    = buf->arg;
+      result   = buf->result;
 
       flags = spin_lock_irqsave(&priv->slock);
       sq_addlast((FAR sq_entry_t *)buf, &priv->tx_free);
       spin_unlock_irqrestore(&priv->slock, flags);
+
+      if (callback != NULL)
+        {
+          callback(&priv->dev, apb, cbarg, result);
+        }
     }
 }
 
@@ -459,8 +485,11 @@ static int i2s_tx_interrupt(int irq, FAR void *context, FAR void *arg)
                                                   priv->dma_channel, false);
   FAR struct esp32p4_i2s_buf_s *buf;
   FAR struct esp32p4_i2s_buf_s *next;
+  irqstate_t flags;
+  bool schedule = false;
 
   ahb_dma_ll_tx_clear_interrupt_status(&AHB_DMA, priv->dma_channel, st);
+  flags = spin_lock_irqsave(&priv->slock);
 
   if ((st & AHB_DMA_OUT_TOTAL_EOF_CH0_INT_ST) != 0)
     {
@@ -486,6 +515,12 @@ static int i2s_tx_interrupt(int irq, FAR void *context, FAR void *arg)
           priv->tx.running = false;
         }
 
+      schedule = true;
+    }
+
+  spin_unlock_irqrestore(&priv->slock, flags);
+  if (schedule)
+    {
       work_queue(HPWORK, &priv->tx.work, i2s_tx_worker, priv, 0);
     }
 
@@ -538,6 +573,7 @@ static uint32_t i2s_txdatawidth(FAR struct i2s_dev_s *dev, int bits)
 
   priv->data_width = bits;
   i2s_ll_tx_set_sample_bit(hw, 32, priv->data_width);
+  i2s_ll_tx_update(hw);
   return priv->data_width;
 }
 
@@ -551,13 +587,28 @@ static int i2s_send(FAR struct i2s_dev_s *dev,
                     uint32_t timeout)
 {
   FAR struct esp32p4_i2s_priv_s *priv = (FAR struct esp32p4_i2s_priv_s *)dev;
+  i2s_dev_t *hw = I2S_LL_GET_HW(priv->port);
   FAR struct esp32p4_i2s_buf_s *buf;
   irqstate_t flags;
 
-  if (apb == NULL || apb->nbytes == 0)
+  if (apb == NULL || apb->nbytes == 0 ||
+      apb->nbytes > apb->nmaxbytes || apb->curbyte >= apb->nbytes ||
+      apb->nbytes - apb->curbyte > I2S_DMA_MAX_BYTES)
     {
       return -EINVAL;
     }
+
+  /* TX and RX share the board's physical BCLK/WS pins.  Select the TX
+   * clock generator whenever playback becomes active.
+   */
+
+  _i2s_ll_mclk_bind_to_tx_clk(hw);
+  esp_gpio_matrix_out(CONFIG_ESP32P4_I2S0_BCLKPIN,
+                      I2S0_O_BCK_PAD_OUT_IDX, false, false);
+  esp_gpio_matrix_out(CONFIG_ESP32P4_I2S0_WSPIN,
+                      I2S0_O_WS_PAD_OUT_IDX, false, false);
+  i2s_ll_tx_set_slave_mod(hw, false);
+  i2s_ll_tx_update(hw);
 
   flags = spin_lock_irqsave(&priv->slock);
   buf = (FAR struct esp32p4_i2s_buf_s *)sq_remfirst(&priv->tx_free);
@@ -572,12 +623,25 @@ static int i2s_send(FAR struct i2s_dev_s *dev,
   buf->arg = arg;
   buf->result = OK;
 
-  buf->dma_desc.dw0.size = I2S_ALIGN_UP(apb->nbytes, 4);
-  buf->dma_desc.dw0.length = apb->nbytes;
+  buf->dma_desc.dw0.size = I2S_ALIGN_UP(apb->nbytes - apb->curbyte, 4);
+  buf->dma_desc.dw0.length = apb->nbytes - apb->curbyte;
   buf->dma_desc.dw0.owner = 1;
   buf->dma_desc.dw0.suc_eof = 1;
-  buf->dma_desc.buffer = apb->samp;
+  buf->dma_desc.buffer = &apb->samp[apb->curbyte];
   buf->dma_desc.next = NULL;
+
+  /* ESP32-P4 data RAM is cached but AHB DMA is not cache coherent.  Clean
+   * both the samples and descriptor after filling them and before exposing
+   * the descriptor to DMA.  Without this, DMA may observe a stale owner bit
+   * or stale sample data and never produce TOTAL_EOF.
+   */
+
+  esp_cache_msync(buf->dma_desc.buffer, buf->dma_desc.dw0.length,
+                  ESP_CACHE_MSYNC_FLAG_DIR_C2M |
+                  ESP_CACHE_MSYNC_FLAG_UNALIGNED);
+  esp_cache_msync(&buf->dma_desc, sizeof(buf->dma_desc),
+                  ESP_CACHE_MSYNC_FLAG_DIR_C2M |
+                  ESP_CACHE_MSYNC_FLAG_UNALIGNED);
 
   if (!priv->tx.running)
     {
@@ -595,6 +659,7 @@ static int i2s_send(FAR struct i2s_dev_s *dev,
     }
 
   spin_unlock_irqrestore(&priv->slock, flags);
+
   return OK;
 }
 
@@ -610,6 +675,10 @@ static void i2s_rx_worker(FAR void *arg)
 {
   FAR struct esp32p4_i2s_priv_s *priv = (FAR struct esp32p4_i2s_priv_s *)arg;
   FAR struct esp32p4_i2s_buf_s *buf;
+  FAR struct ap_buffer_s *apb;
+  i2s_callback_t callback;
+  FAR void *cbarg;
+  int result;
   irqstate_t flags;
 
   for (; ; )
@@ -623,14 +692,53 @@ static void i2s_rx_worker(FAR void *arg)
           break;
         }
 
-      if (buf->callback != NULL)
+      callback = buf->callback;
+      apb      = buf->apb;
+      cbarg    = buf->arg;
+      result   = buf->result;
+
+      if (callback != NULL)
         {
-          buf->callback(&priv->dev, buf->apb, buf->arg, buf->result);
+          /* Descriptor and DMA storage occupy private cache lines.  Never
+           * invalidate an unaligned APB and discard adjacent CPU metadata.
+           * RX length is written by DMA, not inferred from capacity.
+           */
+          int sync = esp_cache_msync(&buf->dma_desc, I2S_DMA_CACHE_ALIGN,
+                                    ESP_CACHE_MSYNC_FLAG_DIR_M2C);
+          unsigned int length = buf->dma_desc.dw0.length;
+          apb->nbytes = 0;
+          if ((sync != ESP_OK && sync != ESP_ERR_NOT_SUPPORTED) ||
+              buf->dma_desc.dw0.owner != 0 || length == 0 ||
+              length > apb->nmaxbytes || (length % 4) != 0 ||
+              buf->dma_desc.dw0.err_eof)
+            {
+              i2serr("RX invalid completion: sync=%d owner=%u length=%u capacity=%u\n",
+                     sync, buf->dma_desc.dw0.owner, length, apb->nmaxbytes);
+              result = -EIO;
+            }
+          else
+            {
+              sync = esp_cache_msync(buf->dma_desc.buffer,
+                                    I2S_ALIGN_UP(length, I2S_DMA_CACHE_ALIGN),
+                                    ESP_CACHE_MSYNC_FLAG_DIR_M2C);
+              if (sync != ESP_OK && sync != ESP_ERR_NOT_SUPPORTED)
+                result = -EIO;
+              else if (result == OK)
+                {
+                  memcpy(apb->samp, buf->dma_desc.buffer, length);
+                  apb->nbytes = length;
+                }
+            }
         }
 
       flags = spin_lock_irqsave(&priv->slock);
       sq_addlast((FAR sq_entry_t *)buf, &priv->rx_free);
       spin_unlock_irqrestore(&priv->slock, flags);
+
+      if (callback != NULL)
+        {
+          callback(&priv->dev, apb, cbarg, result);
+        }
     }
 }
 
@@ -645,15 +753,18 @@ static int i2s_rx_interrupt(int irq, FAR void *context, FAR void *arg)
                                                   priv->dma_channel, false);
   FAR struct esp32p4_i2s_buf_s *buf;
   FAR struct esp32p4_i2s_buf_s *next;
+  irqstate_t flags;
+  bool schedule = false;
 
   ahb_dma_ll_rx_clear_interrupt_status(&AHB_DMA, priv->dma_channel, st);
+  flags = spin_lock_irqsave(&priv->slock);
 
-  if ((st & AHB_DMA_IN_SUC_EOF_CH0_INT_ST) != 0)
+  if ((st & AHB_DMA_IN_DONE_CH0_INT_ST) != 0)
     {
       buf = (FAR struct esp32p4_i2s_buf_s *)sq_remfirst(&priv->rx.act);
       if (buf != NULL)
         {
-          buf->apb->nbytes = buf->apb->nmaxbytes;
+          buf->apb->nbytes = 0;
           buf->result = OK;
           sq_addlast((FAR sq_entry_t *)buf, &priv->rx.done);
         }
@@ -675,6 +786,12 @@ static int i2s_rx_interrupt(int irq, FAR void *context, FAR void *arg)
           priv->rx.running = false;
         }
 
+      schedule = true;
+    }
+
+  spin_unlock_irqrestore(&priv->slock, flags);
+  if (schedule)
+    {
       work_queue(HPWORK, &priv->rx.work, i2s_rx_worker, priv, 0);
     }
 
@@ -727,6 +844,7 @@ static uint32_t i2s_rxdatawidth(FAR struct i2s_dev_s *dev, int bits)
 
   priv->data_width = bits;
   i2s_ll_rx_set_sample_bit(hw, 32, priv->data_width);
+  i2s_ll_rx_update(hw);
   return priv->data_width;
 }
 
@@ -740,13 +858,27 @@ static int i2s_receive(FAR struct i2s_dev_s *dev,
                        uint32_t timeout)
 {
   FAR struct esp32p4_i2s_priv_s *priv = (FAR struct esp32p4_i2s_priv_s *)dev;
+  i2s_dev_t *hw = I2S_LL_GET_HW(priv->port);
   FAR struct esp32p4_i2s_buf_s *buf;
   irqstate_t flags;
 
-  if (apb == NULL || apb->nmaxbytes == 0)
+  if (apb == NULL || apb->nmaxbytes == 0 ||
+      apb->nmaxbytes > I2S_DMA_MAX_BYTES || (apb->nmaxbytes % 4) != 0)
     {
       return -EINVAL;
     }
+
+  /* A capture-only stream cannot borrow BCLK/WS from an inactive TX path.
+   * Make RX the master and route its clock outputs onto the shared pins.
+   */
+
+  _i2s_ll_mclk_bind_to_rx_clk(hw);
+  esp_gpio_matrix_out(CONFIG_ESP32P4_I2S0_BCLKPIN,
+                      I2S0_I_BCK_PAD_OUT_IDX, false, false);
+  esp_gpio_matrix_out(CONFIG_ESP32P4_I2S0_WSPIN,
+                      I2S0_I_WS_PAD_OUT_IDX, false, false);
+  i2s_ll_rx_set_slave_mod(hw, false);
+  i2s_ll_rx_update(hw);
 
   flags = spin_lock_irqsave(&priv->slock);
   buf = (FAR struct esp32p4_i2s_buf_s *)sq_remfirst(&priv->rx_free);
@@ -761,18 +893,34 @@ static int i2s_receive(FAR struct i2s_dev_s *dev,
   buf->arg = arg;
   buf->result = OK;
 
-  buf->dma_desc.dw0.size = I2S_ALIGN_UP(apb->nmaxbytes, 4);
+  memset(&buf->dma_desc, 0, sizeof(buf->dma_desc));
+  buf->dma_desc.dw0.size = apb->nmaxbytes;
   buf->dma_desc.dw0.length = 0;
   buf->dma_desc.dw0.owner = 1;
-  buf->dma_desc.dw0.suc_eof = 1;
-  buf->dma_desc.buffer = apb->samp;
+  buf->dma_desc.dw0.suc_eof = 0;
+  buf->dma_desc.buffer = priv->rx_data[buf - priv->rx_bufs];
   buf->dma_desc.next = NULL;
+
+  int sync = esp_cache_msync(buf->dma_desc.buffer,
+                  I2S_ALIGN_UP(apb->nmaxbytes, I2S_DMA_CACHE_ALIGN),
+                  ESP_CACHE_MSYNC_FLAG_DIR_C2M |
+                  ESP_CACHE_MSYNC_FLAG_INVALIDATE);
+  if (sync == ESP_OK || sync == ESP_ERR_NOT_SUPPORTED)
+    sync = esp_cache_msync(&buf->dma_desc, I2S_DMA_CACHE_ALIGN,
+                          ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+  if (sync != ESP_OK && sync != ESP_ERR_NOT_SUPPORTED)
+    {
+      sq_addlast((FAR sq_entry_t *)buf, &priv->rx_free);
+      spin_unlock_irqrestore(&priv->slock, flags);
+      return -EIO;
+    }
 
   if (!priv->rx.running)
     {
       priv->rx.running = true;
       sq_addlast((FAR sq_entry_t *)buf, &priv->rx.act);
       i2s_ll_rx_set_eof_num(I2S_LL_GET_HW(priv->port), apb->nmaxbytes);
+      i2s_ll_rx_update(I2S_LL_GET_HW(priv->port));
       ahb_dma_ll_rx_reset_channel(&AHB_DMA, priv->dma_channel);
       ahb_dma_ll_rx_set_desc_addr(&AHB_DMA, priv->dma_channel,
                                   (uint32_t)&buf->dma_desc);
@@ -785,6 +933,7 @@ static int i2s_receive(FAR struct i2s_dev_s *dev,
     }
 
   spin_unlock_irqrestore(&priv->slock, flags);
+
   return OK;
 }
 
@@ -796,7 +945,33 @@ static int i2s_receive(FAR struct i2s_dev_s *dev,
 
 static int i2s_ioctl(FAR struct i2s_dev_s *dev, int cmd, unsigned long arg)
 {
-  return -ENOTTY;
+  FAR struct audio_buf_desc_s *bufdesc;
+
+  switch (cmd)
+    {
+      case AUDIOIOC_ALLOCBUFFER:
+        bufdesc = (FAR struct audio_buf_desc_s *)(uintptr_t)arg;
+        if (bufdesc == NULL || bufdesc->u.pbuffer == NULL ||
+            bufdesc->numbytes == 0)
+          {
+            return -EINVAL;
+          }
+
+        return apb_alloc(bufdesc);
+
+      case AUDIOIOC_FREEBUFFER:
+        bufdesc = (FAR struct audio_buf_desc_s *)(uintptr_t)arg;
+        if (bufdesc == NULL || bufdesc->u.buffer == NULL)
+          {
+            return -EINVAL;
+          }
+
+        apb_free(bufdesc->u.buffer);
+        return sizeof(struct audio_buf_desc_s);
+
+      default:
+        return -ENOTTY;
+    }
 }
 
 /****************************************************************************

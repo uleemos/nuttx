@@ -118,7 +118,12 @@ static int sdio_takelock(FAR struct sdio_dev_s *dev)
        */
 
 #ifdef CONFIG_SDIO_MUXBUS
-      SDIO_LOCK(dev, true);
+      ret = SDIO_LOCK(dev, true);
+      if (ret < 0)
+        {
+          nxmutex_unlock(&dev->mutex);
+          return ret;
+        }
 #endif
     }
   else
@@ -202,7 +207,8 @@ int sdio_io_rw_direct(FAR struct sdio_dev_s *dev, bool write,
 
   /* Send CMD52 command */
 
-  sdio_takelock(dev);
+  ret = sdio_takelock(dev);
+  if (ret < 0) return ret;
   ret = sdio_sendcmdpoll(dev, SD_ACMD52, arg.value);
   if (ret != OK)
     {
@@ -278,7 +284,8 @@ int sdio_io_rw_extended(FAR struct sdio_dev_s *dev, bool write,
       arg.cmd53.byte_block_count = nblocks;
     }
 
-  sdio_takelock(dev);
+  ret = sdio_takelock(dev);
+  if (ret < 0) return ret;
 
   /* Send CMD53 command */
 
@@ -435,7 +442,8 @@ int sdio_probe(FAR struct sdio_dev_s *dev)
   sdio_io_rw_direct(dev, true, 0, SDIO_CCCR_IOABORT,
                     SDIO_CCCR_IORESET, NULL);
 
-  sdio_takelock(dev);
+  ret = sdio_takelock(dev);
+  if (ret < 0) return ret;
 
   /* Set device state from reset to idle */
 

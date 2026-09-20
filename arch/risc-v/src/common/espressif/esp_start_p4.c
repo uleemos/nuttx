@@ -484,6 +484,15 @@ void __esp_start(void)
 {
   esp_err_t ret;
 
+#ifdef CONFIG_ESP32P4_FPU_DIAGNOSTIC
+  /* P4 TRM 2.6.3, p110: FS must be enabled before any RV32F use.
+   * Keep this inline: flash mapping is not established at this point.
+   */
+
+  __asm__ volatile("li t0, 0x2000\ncsrs mstatus, t0\nfscsr zero"
+                   ::: "t0", "memory");
+#endif
+
   esp_cpu_intr_set_ivt_addr(&_vector_table);
 
 #if SOC_INT_CLIC_SUPPORTED

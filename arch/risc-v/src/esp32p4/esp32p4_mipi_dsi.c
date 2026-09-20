@@ -27,8 +27,10 @@
 #include <nuttx/config.h>
 
 #include <sys/types.h>
+#include <inttypes.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
@@ -45,8 +47,15 @@
 #include "hal/mipi_dsi_host_ll.h"
 #include "hal/mipi_dsi_brg_ll.h"
 #include "hal/mipi_dsi_phy_ll.h"
+#include "hal/dw_gdma_hal.h"
+#include "hal/dw_gdma_ll.h"
+#include "hal/dw_gdma_types.h"
+#include "hal/ldo_ll.h"
+#include "hal/clk_gate_ll.h"
+#include "esp_private/periph_ctrl.h"
 #include "soc/hp_sys_clkrst_struct.h"
 #include "soc/pmu_struct.h"
+#include "soc/reg_base.h"
 
 #include "esp32p4_mipi_dsi.h"
 
@@ -56,6 +65,11 @@
 
 #define DSI_REF_CLK_HZ           40000000UL /* 40 MHz XTAL */
 #define DSI_DPI_SRC_CLK_MHZ      240.0f     /* 240 MHz PLL */
+#define DSI_DMA_CHANNEL          3          /* CSI=0, PPA=0..2 */
+#define DSI_MIPI_PHY_LDO_UNIT    2          /* LDO channel 3 */
+#define DSI_MIPI_PHY_LDO_MV      2500
+#define DSI_PHY_READY_TIMEOUT_US 100000
+#define DSI_CMD_TIMEOUT_US       100000
 
 /****************************************************************************
  * Private Types
@@ -65,11 +79,13 @@ struct esp32p4_dsi_dev_s
 {
   struct fb_vtable_s          vtable;
   mipi_dsi_hal_context_t      hal;
+  dw_gdma_hal_context_t       dma_hal;
   struct esp32p4_dsi_config_s config;
   mutex_t                     lock;
   FAR uint8_t                *fb_mem;
   size_t                      fb_size;
   bool                        streaming;
+  bool                        dma_initialized;
   bool                        initialized;
 };
 
@@ -108,6 +124,7 @@ static struct esp32p4_dsi_dev_s g_dsi_dev =
   .fb_mem         = NULL,
   .fb_size        = 0,
   .streaming      = false,
+  .dma_initialized = false,
   .initialized    = false,
 };
 
@@ -121,25 +138,130 @@ static struct esp32p4_dsi_dev_s g_dsi_dev =
 
 static void esp32p4_dsi_enable_clocks(uint32_t div)
 {
-  /* 1. Enable peripheral system clock and PHY configuration clock */
+  uint8_t dref = 0;
+  uint8_t mul = 0;
+  bool use_rail_voltage = false;
 
-  HP_SYS_CLKRST.soc_clk_ctrl1.reg_dsi_sys_clk_en = 1;
-  HP_SYS_CLKRST.peri_clk_ctrl03.reg_mipi_dsi_dphy_cfg_clk_en = 1;
-  HP_SYS_CLKRST.peri_clk_ctrl03.reg_mipi_dsi_dphy_pll_refclk_en = 1;
+  /* CSI and DSI share LDO_VO3.  Re-enabling the configured rail is safe and
+   * makes display initialization independent from camera initialization.
+   */
 
-  /* 2. Configure DPI pixel clock source and divider */
+  ldo_ll_voltage_to_dref_mul(DSI_MIPI_PHY_LDO_UNIT,
+                             DSI_MIPI_PHY_LDO_MV,
+                             &dref, &mul, &use_rail_voltage);
+  ldo_ll_adjust_voltage(DSI_MIPI_PHY_LDO_UNIT, dref, mul,
+                        use_rail_voltage);
+  ldo_ll_set_owner(DSI_MIPI_PHY_LDO_UNIT, LDO_LL_UNIT_OWNER_SW);
+  ldo_ll_enable_ripple_suppression(DSI_MIPI_PHY_LDO_UNIT, true);
+  ldo_ll_enable(DSI_MIPI_PHY_LDO_UNIT, true);
+  up_udelay(5000);
 
-  HP_SYS_CLKRST.peri_clk_ctrl03.reg_mipi_dsi_dpiclk_src_sel = 1; /* PLL_F240M */
-  if (div > 0)
+  PERIPH_RCC_ATOMIC()
     {
-      HP_SYS_CLKRST.peri_clk_ctrl03.reg_mipi_dsi_dpiclk_div_num = div - 1;
+      clk_gate_ll_ref_20m_clk_en(true);
+      mipi_dsi_ll_enable_bus_clock(0, true);
+      mipi_dsi_ll_reset_register(0);
+      mipi_dsi_ll_set_phy_config_clock_source(
+        0, MIPI_DSI_PHY_CFG_CLK_SRC_PLL_F20M);
+      mipi_dsi_ll_enable_phy_config_clock(0, true);
+      mipi_dsi_ll_set_phy_pllref_clock_source(
+        0, MIPI_DSI_PHY_PLLREF_CLK_SRC_XTAL);
+      mipi_dsi_ll_set_phy_pll_ref_clock_div(0, 1);
+      mipi_dsi_ll_enable_phy_pllref_clock(0, true);
+      mipi_dsi_ll_set_dpi_clock_source(0,
+                                      MIPI_DSI_DPI_CLK_SRC_PLL_F240M);
+      mipi_dsi_ll_set_dpi_clock_div(0, div);
+      mipi_dsi_ll_enable_dpi_clock(0, true);
+    }
+}
+
+static int esp32p4_dsi_wait_phy_ready(FAR struct esp32p4_dsi_dev_s *priv)
+{
+  unsigned int elapsed;
+
+  for (elapsed = 0; elapsed < DSI_PHY_READY_TIMEOUT_US; elapsed += 100)
+    {
+      if (mipi_dsi_phy_ll_is_pll_locked(priv->hal.host) &&
+          mipi_dsi_phy_ll_are_lanes_stopped(priv->hal.host,
+                                             priv->config.num_lanes))
+        {
+          return OK;
+        }
+
+      up_udelay(100);
     }
 
-  HP_SYS_CLKRST.peri_clk_ctrl03.reg_mipi_dsi_dpiclk_en = 1;
+  return -ETIMEDOUT;
+}
 
-  /* 3. Release reset */
+static int esp32p4_dsi_configure_dma(FAR struct esp32p4_dsi_dev_s *priv)
+{
+  dw_gdma_dev_t *dev;
+  uint32_t beats;
 
-  HP_SYS_CLKRST.hp_rst_en0.reg_rst_en_dsi_brg = 0;
+  if (priv->fb_mem == NULL || priv->fb_size == 0 ||
+      (priv->fb_size % sizeof(uint64_t)) != 0)
+    {
+      return -EINVAL;
+    }
+
+  PERIPH_RCC_ATOMIC()
+    {
+      dw_gdma_ll_enable_bus_clock(0, true);
+    }
+
+  priv->dma_hal.dev = DW_GDMA_LL_GET_HW(0);
+  dev = priv->dma_hal.dev;
+  beats = priv->fb_size / sizeof(uint64_t);
+
+  dw_gdma_ll_enable_controller(dev, true);
+  dw_gdma_ll_channel_enable(dev, DSI_DMA_CHANNEL, false);
+  dw_gdma_ll_channel_clear_intr(dev, DSI_DMA_CHANNEL, UINT32_MAX);
+  dw_gdma_ll_channel_set_priority(dev, DSI_DMA_CHANNEL, 3);
+  dw_gdma_ll_channel_set_trans_flow(dev, DSI_DMA_CHANNEL,
+                                    DW_GDMA_ROLE_MEM,
+                                    DW_GDMA_ROLE_PERIPH_DSI,
+                                    DW_GDMA_FLOW_CTRL_SELF);
+  dw_gdma_ll_channel_set_src_handshake_interface(dev, DSI_DMA_CHANNEL,
+                                                 DW_GDMA_HANDSHAKE_HW);
+  dw_gdma_ll_channel_set_dst_handshake_interface(dev, DSI_DMA_CHANNEL,
+                                                 DW_GDMA_HANDSHAKE_HW);
+  dw_gdma_ll_channel_set_dst_handshake_periph(dev, DSI_DMA_CHANNEL,
+                                              DW_GDMA_ROLE_PERIPH_DSI);
+  dw_gdma_ll_channel_set_src_multi_block_type(dev, DSI_DMA_CHANNEL,
+                                              DW_GDMA_BLOCK_TRANSFER_RELOAD);
+  dw_gdma_ll_channel_set_dst_multi_block_type(dev, DSI_DMA_CHANNEL,
+                                              DW_GDMA_BLOCK_TRANSFER_RELOAD);
+  dw_gdma_ll_channel_set_src_addr(dev, DSI_DMA_CHANNEL,
+                                  (uint32_t)(uintptr_t)priv->fb_mem);
+  dw_gdma_ll_channel_set_dst_addr(dev, DSI_DMA_CHANNEL,
+                                  MIPI_DSI_BRG_MEM_BASE);
+  dw_gdma_ll_channel_set_trans_block_size(dev, DSI_DMA_CHANNEL, beats);
+  dw_gdma_ll_channel_set_src_master_port(dev, DSI_DMA_CHANNEL,
+                                         (uintptr_t)priv->fb_mem);
+  dw_gdma_ll_channel_set_dst_master_port(dev, DSI_DMA_CHANNEL,
+                                         MIPI_DSI_BRG_MEM_BASE);
+  dw_gdma_ll_channel_set_src_trans_width(dev, DSI_DMA_CHANNEL,
+                                         DW_GDMA_TRANS_WIDTH_64);
+  dw_gdma_ll_channel_set_dst_trans_width(dev, DSI_DMA_CHANNEL,
+                                         DW_GDMA_TRANS_WIDTH_64);
+  dw_gdma_ll_channel_set_src_burst_items(dev, DSI_DMA_CHANNEL,
+                                         DW_GDMA_BURST_ITEMS_512);
+  dw_gdma_ll_channel_set_dst_burst_items(dev, DSI_DMA_CHANNEL,
+                                         DW_GDMA_BURST_ITEMS_256);
+  dw_gdma_ll_channel_set_src_burst_mode(dev, DSI_DMA_CHANNEL,
+                                        DW_GDMA_BURST_MODE_INCREMENT);
+  dw_gdma_ll_channel_set_dst_burst_mode(dev, DSI_DMA_CHANNEL,
+                                        DW_GDMA_BURST_MODE_FIXED);
+  dw_gdma_ll_channel_set_src_burst_len(dev, DSI_DMA_CHANNEL, 16);
+  dw_gdma_ll_channel_set_dst_burst_len(dev, DSI_DMA_CHANNEL, 16);
+  dw_gdma_ll_channel_set_block_markers(dev, DSI_DMA_CHANNEL,
+                                       false, false, true);
+  dw_gdma_ll_channel_enable_intr_propagation(dev, DSI_DMA_CHANNEL,
+                                             UINT32_MAX, false);
+  priv->dma_initialized = true;
+
+  return OK;
 }
 
 /****************************************************************************
@@ -282,7 +404,9 @@ int esp32p4_mipi_dsi_initialize(
   FAR struct esp32p4_dsi_dev_s *priv = &g_dsi_dev;
   mipi_dsi_hal_config_t hal_cfg;
   uint32_t div;
+  uint32_t bits_per_pixel;
   lcd_color_format_t color_fmt;
+  int ret;
 
   if (config == NULL)
     {
@@ -311,10 +435,67 @@ int esp32p4_mipi_dsi_initialize(
 
   mipi_dsi_hal_init(&priv->hal, &hal_cfg);
 
+  /* Keep the bridge register and FIFO clocks running during early bring-up.
+   * This also prevents a first-burst stall while the DPI path is empty.
+   */
+
+  mipi_dsi_brg_ll_force_enable_reg_clock(priv->hal.bridge, true);
+  mipi_dsi_brg_ll_enable_ref_clock(priv->hal.bridge, true);
+  priv->hal.bridge->mem_clk_ctrl.dsi_bridge_mem_clk_force_on = 1;
+  priv->hal.bridge->mem_clk_ctrl.dsi_mem_clk_force_on = 1;
+
   /* 3. Configure D-PHY TX PLL */
 
   mipi_dsi_hal_configure_phy_pll(&priv->hal, DSI_REF_CLK_HZ,
                                  config->lane_bit_rate_mbps);
+
+  ret = esp32p4_dsi_wait_phy_ready(priv);
+  if (ret < 0)
+    {
+      nxmutex_unlock(&priv->lock);
+      return ret;
+    }
+
+  /* Command mode is used for EK79007 initialization before video starts. */
+
+  mipi_dsi_host_ll_enable_video_mode(priv->hal.host, false);
+  mipi_dsi_host_ll_set_clock_lane_state(
+    priv->hal.host, MIPI_DSI_LL_CLOCK_LANE_STATE_AUTO);
+  mipi_dsi_phy_ll_set_switch_time(priv->hal.host, 50, 104, 46, 128);
+  mipi_dsi_host_ll_enable_rx_crc(priv->hal.host, true);
+  mipi_dsi_host_ll_enable_rx_ecc(priv->hal.host, true);
+  mipi_dsi_host_ll_enable_tx_eotp(priv->hal.host, true, false);
+  mipi_dsi_host_ll_set_timeout_clock_division(
+    priv->hal.host, (uint32_t)(config->lane_bit_rate_mbps / 80.0f + 0.5f));
+  mipi_dsi_host_ll_set_escape_clock_division(
+    priv->hal.host, (uint32_t)(config->lane_bit_rate_mbps / 144.0f + 0.5f));
+  mipi_dsi_host_ll_set_timeout_count(priv->hal.host, 0, 0, 0, 0,
+                                     0, 0, 0);
+  mipi_dsi_phy_ll_set_max_read_time(priv->hal.host, 6000);
+  mipi_dsi_phy_ll_set_stop_wait_time(priv->hal.host, 0x3f);
+
+  mipi_dsi_host_ll_enable_te_ack(priv->hal.host, false);
+  /* The EK79007 module does not return write acknowledgements during its
+   * reset-time initialization.  Requesting ACK leaves the command buffered
+   * while lane 0 waits in bus-turnaround direction.
+   */
+
+  mipi_dsi_host_ll_enable_cmd_ack(priv->hal.host, false);
+  mipi_dsi_host_ll_enable_bta(priv->hal.host, false);
+  mipi_dsi_host_ll_set_gen_short_wr_speed_mode(
+    priv->hal.host, 0, MIPI_DSI_LL_TRANS_SPEED_LP);
+  mipi_dsi_host_ll_set_gen_short_wr_speed_mode(
+    priv->hal.host, 1, MIPI_DSI_LL_TRANS_SPEED_LP);
+  mipi_dsi_host_ll_set_gen_short_wr_speed_mode(
+    priv->hal.host, 2, MIPI_DSI_LL_TRANS_SPEED_LP);
+  mipi_dsi_host_ll_set_gen_long_wr_speed_mode(
+    priv->hal.host, MIPI_DSI_LL_TRANS_SPEED_LP);
+  mipi_dsi_host_ll_set_dcs_short_wr_speed_mode(
+    priv->hal.host, 0, MIPI_DSI_LL_TRANS_SPEED_LP);
+  mipi_dsi_host_ll_set_dcs_short_wr_speed_mode(
+    priv->hal.host, 1, MIPI_DSI_LL_TRANS_SPEED_LP);
+  mipi_dsi_host_ll_set_dcs_long_wr_speed_mode(
+    priv->hal.host, MIPI_DSI_LL_TRANS_SPEED_LP);
 
   /* 4. Configure horizontal and vertical video timing */
 
@@ -337,9 +518,41 @@ int esp32p4_mipi_dsi_initialize(
 
   color_fmt = (config->color_format == ESP32P4_DSI_COLOR_RGB888) ?
               LCD_COLOR_FMT_RGB888 : LCD_COLOR_FMT_RGB565;
+  bits_per_pixel = (config->color_format == ESP32P4_DSI_COLOR_RGB888) ?
+                   24 : 16;
+
+  mipi_dsi_host_ll_dpi_set_vcid(priv->hal.host, 0);
+  mipi_dsi_host_ll_dpi_set_color_coding(priv->hal.host, color_fmt, 0);
+  mipi_dsi_host_ll_dpi_set_timing_polarity(priv->hal.host, false, false,
+                                            false, false, false);
+  mipi_dsi_host_ll_dpi_enable_lp_horizontal_timing(priv->hal.host,
+                                                    true, true);
+  mipi_dsi_host_ll_dpi_enable_lp_vertical_timing(priv->hal.host,
+                                                  true, true, true, true);
+  mipi_dsi_host_ll_dpi_enable_lp_command(priv->hal.host, true);
+  mipi_dsi_host_ll_dpi_enable_frame_ack(priv->hal.host, true);
+  mipi_dsi_host_ll_dpi_set_video_burst_type(
+    priv->hal.host, MIPI_DSI_LL_VIDEO_BURST_WITH_SYNC_PULSES);
+  mipi_dsi_host_ll_dpi_set_video_packet_pixel_num(priv->hal.host,
+                                                   config->timing.width);
+  mipi_dsi_host_ll_dpi_set_trunks_num(priv->hal.host, 0);
+  mipi_dsi_host_ll_dpi_set_null_packet_size(priv->hal.host, 0);
 
   mipi_dsi_brg_ll_set_input_color_format(priv->hal.bridge, color_fmt);
   mipi_dsi_brg_ll_set_output_color_format(priv->hal.bridge, color_fmt, 0);
+  mipi_dsi_brg_ll_set_num_pixel_bits(priv->hal.bridge,
+                                     config->timing.width *
+                                     config->timing.height *
+                                     bits_per_pixel);
+  mipi_dsi_brg_ll_set_underrun_discard_count(priv->hal.bridge,
+                                              config->timing.width);
+  mipi_dsi_brg_ll_set_flow_controller(priv->hal.bridge,
+                                      MIPI_DSI_LL_FLOW_CONTROLLER_DMA);
+  mipi_dsi_brg_ll_set_multi_block_number(priv->hal.bridge, 1);
+  mipi_dsi_brg_ll_set_burst_len(priv->hal.bridge, 256);
+  mipi_dsi_brg_ll_set_empty_threshold(priv->hal.bridge, 1024 - 256);
+  mipi_dsi_brg_ll_enable(priv->hal.bridge, true);
+  mipi_dsi_brg_ll_update_dpi_config(priv->hal.bridge);
 
   priv->initialized = true;
   nxmutex_unlock(&priv->lock);
@@ -357,6 +570,8 @@ int esp32p4_mipi_dsi_write_dcs(uint8_t vc, uint8_t cmd,
                                FAR const void *param, uint16_t param_size)
 {
   FAR struct esp32p4_dsi_dev_s *priv = &g_dsi_dev;
+  unsigned int elapsed;
+  int ret = OK;
 
   if (!priv->initialized)
     {
@@ -366,9 +581,32 @@ int esp32p4_mipi_dsi_write_dcs(uint8_t vc, uint8_t cmd,
   nxmutex_lock(&priv->lock);
   mipi_dsi_hal_host_gen_write_dcs_command(&priv->hal, vc, cmd, 1,
                                           param, param_size);
+
+  /* The HAL queues commands asynchronously.  The panel setup sequence must
+   * not switch the host into video mode while a command is still buffered.
+   */
+
+  for (elapsed = 0; elapsed < DSI_CMD_TIMEOUT_US; elapsed += 100)
+    {
+      if (priv->hal.host->cmd_pkt_status.gen_cmd_empty &&
+          priv->hal.host->cmd_pkt_status.gen_pld_w_empty &&
+          priv->hal.host->cmd_pkt_status.gen_buff_cmd_empty &&
+          priv->hal.host->cmd_pkt_status.gen_buff_pld_empty)
+        {
+          break;
+        }
+
+      up_udelay(100);
+    }
+
+  if (elapsed >= DSI_CMD_TIMEOUT_US)
+    {
+      ret = -ETIMEDOUT;
+    }
+
   nxmutex_unlock(&priv->lock);
 
-  return OK;
+  return ret;
 }
 
 /****************************************************************************
@@ -400,13 +638,22 @@ int esp32p4_mipi_dsi_read_dcs(uint8_t vc, uint8_t cmd,
 int esp32p4_mipi_dsi_set_framebuffer(uintptr_t fb_addr, size_t fb_size)
 {
   FAR struct esp32p4_dsi_dev_s *priv = &g_dsi_dev;
+  int ret;
+
+  if (!priv->initialized || fb_addr == 0 || fb_size == 0)
+    {
+      return -EINVAL;
+    }
 
   nxmutex_lock(&priv->lock);
   priv->fb_mem  = (FAR uint8_t *)fb_addr;
   priv->fb_size = fb_size;
+  esp_cache_msync(priv->fb_mem, priv->fb_size,
+                  ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+  ret = esp32p4_dsi_configure_dma(priv);
   nxmutex_unlock(&priv->lock);
 
-  return OK;
+  return ret;
 }
 
 /****************************************************************************
@@ -416,6 +663,7 @@ int esp32p4_mipi_dsi_set_framebuffer(uintptr_t fb_addr, size_t fb_size)
 int esp32p4_mipi_dsi_start_video(void)
 {
   FAR struct esp32p4_dsi_dev_s *priv = &g_dsi_dev;
+  int ret;
 
   if (!priv->initialized)
     {
@@ -424,10 +672,23 @@ int esp32p4_mipi_dsi_start_video(void)
 
   nxmutex_lock(&priv->lock);
 
-  /* Enable DSI Host Video Mode & DSI Bridge */
+  if (!priv->dma_initialized)
+    {
+      ret = esp32p4_dsi_configure_dma(priv);
+      if (ret < 0)
+        {
+          nxmutex_unlock(&priv->lock);
+          return ret;
+        }
+    }
 
+  /* Start memory-to-DSI transfer before enabling DPI output. */
+
+  dw_gdma_ll_channel_enable(priv->dma_hal.dev, DSI_DMA_CHANNEL, true);
   mipi_dsi_host_ll_enable_video_mode(priv->hal.host, true);
   mipi_dsi_brg_ll_enable(priv->hal.bridge, true);
+  mipi_dsi_brg_ll_enable_dpi_output(priv->hal.bridge, true);
+  mipi_dsi_brg_ll_update_dpi_config(priv->hal.bridge);
 
   priv->streaming = true;
   nxmutex_unlock(&priv->lock);
@@ -450,12 +711,81 @@ int esp32p4_mipi_dsi_stop_video(void)
     }
 
   nxmutex_lock(&priv->lock);
+  mipi_dsi_brg_ll_enable_dpi_output(priv->hal.bridge, false);
+  mipi_dsi_brg_ll_update_dpi_config(priv->hal.bridge);
   mipi_dsi_brg_ll_enable(priv->hal.bridge, false);
   mipi_dsi_host_ll_enable_video_mode(priv->hal.host, false);
+  if (priv->dma_initialized)
+    {
+      dw_gdma_ll_channel_enable(priv->dma_hal.dev, DSI_DMA_CHANNEL, false);
+    }
+
   priv->streaming = false;
   nxmutex_unlock(&priv->lock);
 
   return OK;
+}
+
+/****************************************************************************
+ * Name: esp32p4_mipi_dsi_dump
+ ****************************************************************************/
+
+void esp32p4_mipi_dsi_dump(void)
+{
+  FAR struct esp32p4_dsi_dev_s *priv = &g_dsi_dev;
+  FAR dw_gdma_dev_t *dma = priv->dma_hal.dev;
+
+  printf("=== ESP32-P4 MIPI DSI ===\n");
+  printf("state init=%d stream=%d dma=%d fb=%p bytes=%zu\n",
+         priv->initialized, priv->streaming, priv->dma_initialized,
+         priv->fb_mem, priv->fb_size);
+  if (priv->hal.host != NULL)
+    {
+      printf("host version=%08" PRIx32 " pwr=%08" PRIx32
+             " mode=%08" PRIx32 " vid=%08" PRIx32 "\n",
+             priv->hal.host->version.val, priv->hal.host->pwr_up.val,
+             priv->hal.host->mode_cfg.val,
+             priv->hal.host->vid_mode_cfg.val);
+      printf("host phy=%08" PRIx32 " cmd=%08" PRIx32
+             " int0=%08" PRIx32 " int1=%08" PRIx32 "\n",
+             priv->hal.host->phy_status.val,
+             priv->hal.host->cmd_pkt_status.val,
+             priv->hal.host->int_st0.val,
+             priv->hal.host->int_st1.val);
+    }
+
+  if (priv->hal.bridge != NULL)
+    {
+      printf("brg clk=%08" PRIx32 " en=%08" PRIx32
+             " flow=%08" PRIx32 " dpi=%08" PRIx32 "\n",
+             priv->hal.bridge->clk_en.val, priv->hal.bridge->en.val,
+             priv->hal.bridge->dma_flow_ctrl.val,
+             priv->hal.bridge->dpi_misc_config.val);
+      printf("brg depth=%08" PRIx32 " raw=%08" PRIx32
+             " st=%08" PRIx32 " bits=%08" PRIx32 "\n",
+             priv->hal.bridge->fifo_flow_status.val,
+             priv->hal.bridge->int_raw.val, priv->hal.bridge->int_st.val,
+             priv->hal.bridge->blk_raw_num_cfg.val);
+    }
+
+  if (dma != NULL)
+    {
+      printf("dma chen=%08" PRIx32 " sar=%08" PRIx32
+             " dar=%08" PRIx32 " ts=%08" PRIx32 "\n",
+             dma->chen0.val, dma->ch[DSI_DMA_CHANNEL].sar0.sar0,
+             dma->ch[DSI_DMA_CHANNEL].dar0.dar0,
+             (uint32_t)dma->ch[DSI_DMA_CHANNEL].block_ts0.block_ts);
+      printf("dma ctl0=%08" PRIx32 " ctl1=%08" PRIx32
+             " cfg0=%08" PRIx32 " cfg1=%08" PRIx32
+             " istat=%08" PRIx32 "\n",
+             dma->ch[DSI_DMA_CHANNEL].ctl0.val,
+             dma->ch[DSI_DMA_CHANNEL].ctl1.val,
+             dma->ch[DSI_DMA_CHANNEL].cfg0.val,
+             dma->ch[DSI_DMA_CHANNEL].cfg1.val,
+             dw_gdma_ll_channel_get_intr_status(dma, DSI_DMA_CHANNEL));
+    }
+
+  printf("==========================\n");
 }
 
 /****************************************************************************
@@ -480,12 +810,16 @@ FAR struct fb_vtable_s *esp32p4_fb_initialize(int display)
     {
       priv->fb_size = priv->config.timing.width *
                       priv->config.timing.height * bytes_per_pixel;
-      priv->fb_mem  = (FAR uint8_t *)kmm_memalign(64, priv->fb_size);
+      priv->fb_mem  = (FAR uint8_t *)kumm_memalign(64, priv->fb_size);
       if (priv->fb_mem != NULL)
         {
           memset(priv->fb_mem, 0, priv->fb_size);
           esp_cache_msync((void *)priv->fb_mem, priv->fb_size,
                           ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+          if (priv->initialized)
+            {
+              esp32p4_dsi_configure_dma(priv);
+            }
         }
     }
 
